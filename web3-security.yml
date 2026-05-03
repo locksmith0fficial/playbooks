@@ -1,0 +1,161 @@
+# ============================================================================
+#  .github/workflows/web3-security.yml
+#  Drop-in CI for pentest-ai running the Web3 dApp bug bounty playbook.
+#  Triggers on every PR + nightly schedule against staging.
+# ============================================================================
+
+name: Web3 dApp Security Scan
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'contracts/**'
+      - 'package.json'
+      - 'package-lock.json'
+  schedule:
+    - cron: '0 3 * * *'           # 03:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target dApp URL'
+        required: true
+        default: 'https://staging.protocol.com'
+
+jobs:
+  # --------------------------------------------------------------------------
+  #  Fast PR gate: web2.5 layer only, fails on High
+  # --------------------------------------------------------------------------
+  pr-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write       # for SARIF upload
+      pull-requests: write         # for PR comments
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pentest-ai
+        run: pip install ptai
+
+      - name: Run web2.5 fast scan
+        run: |
+          ptai start ${{ vars.STAGING_URL }} \
+            --ci \
+            --playbook ./playbooks/web3-dapp-bugbounty.yaml \
+            --phases recon-assets,recon-content,js-analysis,web-app,supply-chain \
+            --fail-on high \
+            --sarif pentest.sarif \
+            --scope-file ./security/scope.txt
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          STAGING_URL: ${{ vars.STAGING_URL }}
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pentest.sarif
+          category: pentest-ai-web2.5
+
+  # --------------------------------------------------------------------------
+  #  Nightly deep scan: full Web3 playbook against staging
+  # --------------------------------------------------------------------------
+  nightly-deep-scan:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      security-events: write
+      issues: write                # auto-file issues for new Critical/High
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pentest-ai + extras
+        run: |
+          pip install ptai
+          # Web3-specific tooling not bundled by default
+          npm install -g @apidevtools/swagger-cli
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+
+      - name: Run full Web3 playbook
+        run: |
+          ptai playbook run ./playbooks/web3-dapp-bugbounty.yaml \
+            --input target=${{ inputs.target || vars.STAGING_URL }} \
+            --input root_domain=${{ vars.ROOT_DOMAIN }} \
+            --input in_scope_assets=@./security/scope.txt \
+            --input bounty_program=${{ vars.BOUNTY_SLUG }} \
+            --ci \
+            --fail-on high \
+            --sarif pentest-deep.sarif \
+            --report-out reports/nightly-${{ github.run_id }}.md \
+            --hitl false                            # nightly is fully autonomous
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pentest-deep.sarif
+          category: pentest-ai-web3-deep
+
+      - name: Persist report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web3-pentest-report-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
+
+      - name: File issues for new Critical/High findings
+        if: failure()
+        run: |
+          ptai findings export --severity critical,high --format github-issues \
+            | gh issue create --label "security,web3,pentest-ai" -F -
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --------------------------------------------------------------------------
+  #  LLM red-team probe (only if dApp ships an AI feature)
+  # --------------------------------------------------------------------------
+  llm-redteam:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install ptai
+      - name: OWASP LLM Top 10 probe
+        run: |
+          ptai start ${{ vars.AI_FEATURE_URL }} \
+            --enable-llm-redteam \
+            --probes 80 \
+            --sarif llm-redteam.sarif \
+            --fail-on high
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: llm-redteam.sarif
+          category: pentest-ai-llm
